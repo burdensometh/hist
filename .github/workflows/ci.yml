@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
-    - uses: astral-sh/setup-uv@v10.3.3
+    - uses: astral-sh/setup-uv@v10.4.0
     - name: Install nox
       run: uv tool install nox
     - name: PyLint
@@ -49,7 +49,7 @@ jobs:
         allow-prereleases: true
 
     - name: Setup uv
-      uses: astral-sh/setup-uv@v10.3.3
+      uses: astral-sh/setup-uv@v10.4.0
 
     - name: Prepare venv
       run: uv venv
@@ -75,7 +75,7 @@ jobs:
         fetch-depth: 0
 
     - name: Setup uv
-      uses: astral-sh/setup-uv@v10.3.3
+      uses: astral-sh/setup-uv@v10.4.0
 
     - name: Install nox
       run: uv tool install nox
@@ -96,7 +96,7 @@ jobs:
         python-version: '3.11'
 
     - name: Setup uv
-      uses: astral-sh/setup-uv@v10.3.3
+      uses: astral-sh/setup-uv@v10.4.0
 
     - name: Install nox
       run: uv tool install nox
