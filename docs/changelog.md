@@ -2,6 +2,14 @@
 
 ## In progress
 
+Features:
+
+* `Hist.rebin_lossless()` merges complete bins of a continuous axis onto
+  coarser edges when every requested edge coincides with an existing edge,
+  preserving counts, variances, mean accumulators and the flow bins. A
+  requested edge that would split an original bin raises `ValueError` naming
+  the unsplittable bin instead of making an approximate allocation.
+
 Fixes:
 
 * `Hist.from_columns` builds an `IntCategory` axis from NumPy integer arrays

@@ -84,6 +84,87 @@ def process_mistaken_quick_construct(
 
 NO_METADATA = object()
 
+# Relative tolerance for matching requested rebin edges onto existing axis
+# edges. Only edges that coincide with an original edge within this tolerance
+# are accepted, so a lossless merge never silently splits a bin.
+_EDGE_REL_TOLERANCE = 1e-12
+# Absolute floor for axes whose edges lie near zero, where a relative
+# tolerance becomes meaningless.
+_EDGE_ABS_TOLERANCE = 1e-12
+
+
+def _edge_tolerance(old_edges: np.typing.NDArray[Any]) -> float:
+    return float(
+        _EDGE_ABS_TOLERANCE
+        + _EDGE_REL_TOLERANCE * max(abs(float(old_edges[0])), abs(float(old_edges[-1])))
+    )
+
+
+def _match_rebin_edges(
+    edges: Sequence[float], old_edges: np.typing.NDArray[Any]
+) -> np.typing.NDArray[np.intp]:
+    """
+    Map requested coarse bin edges onto indices of the original axis edges.
+
+    Every requested edge must coincide with an original edge (within a
+    scale-aware tolerance); otherwise the request would cut through an
+    original bin, which cannot be done losslessly from binned data alone.
+    The first and last requested edges must equal the axis outer edges so
+    the rebin covers exactly the same in-range region.
+    """
+    requested = np.asarray(edges, dtype=float)
+    old = np.asarray(old_edges, dtype=float)
+    if requested.ndim != 1:
+        msg = "Rebin edges must be a one-dimensional sequence"
+        raise ValueError(msg)
+    if requested.size < 2:
+        msg = "At least two edges are required to define a binning"
+        raise ValueError(msg)
+    if np.any(np.diff(requested) <= 0):
+        msg = "Rebin edges must be strictly increasing"
+        raise ValueError(msg)
+    tolerance = _edge_tolerance(old)
+    if not np.isclose(requested[0], old[0], rtol=0.0, atol=tolerance):
+        msg = (
+            f"First rebin edge {requested[0]} does not match the axis lower "
+            f"edge {old[0]}; a lossless rebin must cover the whole axis"
+        )
+        raise ValueError(msg)
+    if not np.isclose(requested[-1], old[-1], rtol=0.0, atol=tolerance):
+        msg = (
+            f"Last rebin edge {requested[-1]} does not match the axis upper "
+            f"edge {old[-1]}; a lossless rebin must cover the whole axis"
+        )
+        raise ValueError(msg)
+
+    insertion = np.searchsorted(old, requested)
+    # A requested edge may land on either side of its matching edge within
+    # floating-point tolerance, so check the insertion point and the edge just
+    # before it instead of trusting the insertion point alone.
+    right_index = np.clip(insertion, 0, len(old) - 1)
+    left_index = np.clip(insertion - 1, 0, len(old) - 1)
+    right_distance = np.abs(old[right_index] - requested)
+    left_distance = np.abs(old[left_index] - requested)
+    matched_left = left_distance <= tolerance
+    matched_right = right_distance <= tolerance
+    if not np.all(matched_left | matched_right):
+        first_cut = int(np.argmax(~(matched_left | matched_right)))
+        cut_bin = int(np.clip(insertion[first_cut] - 1, 0, len(old) - 2))
+        msg = (
+            f"Requested edge {float(requested[first_cut])} cuts through "
+            f"original bin {cut_bin} with edges "
+            f"[{old[cut_bin]}, {old[cut_bin + 1]}]. "
+            "That bin cannot be split from binned data alone; rebuild the "
+            "histogram from the original data with the new binning"
+        )
+        raise ValueError(msg)
+    indices = np.where(matched_left & ~matched_right, left_index, right_index)
+    if np.any(np.diff(indices) == 0):
+        msg = "Rebin edges must each fall on a distinct original edge"
+        raise ValueError(msg)
+    return np.asarray(indices, dtype=np.intp)
+
+
 S = TypeVar("S", bound=bh.storage.Storage)
 
 IntHists = TypeVar(
@@ -1056,3 +1137,228 @@ class BaseHist(_Histogram[S], Generic[S], metaclass=MetaConstructor, family=hist
                 return selection[{name: slice(0, len(selection.axes[name]), sum)}]
 
         return self[{name: slice(i_or_list, j, sum)}]
+
+    def rebin_lossless(
+        self, axis: int | str, edges: Sequence[float]
+    ) -> Self:
+        """
+        Merge complete bins of one continuous axis onto coarser edges.
+
+        The rebin is strictly lossless: every requested edge in ``edges`` must
+        coincide with an existing edge of ``axis``, so each new bin is the sum
+        of whole original bins. Counts and (where the storage carries them)
+        variances or mean accumulators are added bin by bin. If a requested
+        edge would split an original bin, no approximation is made — a
+        ``ValueError`` names the bin that cannot be decomposed, and this
+        histogram is left untouched so it can be reused with another binning
+        or rebuilt from the original data.
+
+        Underflow and overflow are not mixed into the first and last regular
+        bins: the flow bins are copied unchanged into the result, and flow
+        stays disabled on axes that had none.
+
+        Parameters
+        ----------
+        axis : int or str
+            Index or name of the axis to rebin. It must be a continuous,
+            non-circular axis (``Regular``, ``Variable`` or ``Integer``);
+            categorical and circular axes are rejected with ``TypeError``.
+        edges : sequence of float
+            Full edges of the requested coarse binning, from the axis lower
+            edge to its upper edge, strictly increasing. Each edge must match
+            an existing axis edge.
+
+        Returns
+        -------
+        BaseHist
+            A new histogram with a ``Variable`` axis carrying the requested
+            edges; all other axes, the storage and the axis name/label are
+            preserved. The original histogram is not modified.
+
+        Raises
+        ------
+        TypeError
+            If the axis is categorical or circular, or the storage is
+            ``MultiCell``.
+        ValueError
+            If ``edges`` is not strictly increasing, does not span the whole
+            axis, or contains an edge that cuts through an original bin.
+        """
+        iaxis = self._name_to_index(axis) if isinstance(axis, str) else axis
+        old_axis = self.axes[iaxis]
+        if isinstance(
+            old_axis,
+            (bh.axis.IntCategory, bh.axis.StrCategory, bh.axis.Boolean),
+        ):
+            msg = (
+                f"Axis {iaxis!r} is categorical; rebin_lossless only supports "
+                "continuous axes"
+            )
+            raise TypeError(msg)
+        if old_axis.traits.circular:
+            msg = (
+                f"Axis {iaxis!r} is circular; rebin_lossless does not support "
+                "circular axes"
+            )
+            raise TypeError(msg)
+        if issubclass(self.storage_type, bh.storage.MultiCell):
+            msg = "rebin_lossless does not support MultiCell storage"
+            raise TypeError(msg)
+
+        old_edges = np.asarray(old_axis.edges, dtype=float)
+        groups = _match_rebin_edges(edges, old_edges)
+
+        new_axis = hist.axis.Variable(
+            old_edges[groups],
+            name=old_axis.name,
+            label=old_axis.label,
+            underflow=old_axis.traits.underflow,
+            overflow=old_axis.traits.overflow,
+        )
+        new_axes = [*self.axes]
+        new_axes[iaxis] = new_axis
+        result = self.__class__(*new_axes, storage=self.storage_type())
+
+        source = self.view(flow=True)
+        target = result.view(flow=True)
+        has_underflow = bool(old_axis.traits.underflow)
+        has_overflow = bool(old_axis.traits.overflow)
+        offset = 1 if has_underflow else 0
+        n_bins = len(old_axis)
+        # First and last original-bin indices (flow-inclusive) of each group
+        group_starts = (groups[:-1] + offset).tolist()
+        group_stops = (groups[1:] + offset).tolist()
+        out_regular = slice(offset, offset + len(group_starts))
+
+        source_array = np.asarray(source)
+        is_mean_storage = issubclass(
+            self.storage_type, (bh.storage.Mean, bh.storage.WeightedMean)
+        )
+
+        if is_mean_storage:
+            # Mean-family accumulators keep a running mean; adding their raw
+            # value field would be wrong, so add the accumulators themselves.
+            self._merge_mean_axis(
+                source,
+                target,
+                iaxis,
+                group_starts,
+                group_stops,
+                offset,
+                has_underflow,
+                has_overflow,
+            )
+        else:
+            # Numeric storages. Weight storage carries two additive fields
+            # (value, variance); the plain storages have a single array. A
+            # dummy final start keeps reduceat from swallowing the overflow;
+            # its result is discarded.
+            reduce_indices = (
+                [*group_starts, n_bins + offset]
+                if has_overflow
+                else group_starts
+            )
+            field_names = typing.cast(
+                "tuple[str, ...] | None", source_array.dtype.names
+            )
+            indexer: list[Any] = [slice(None)] * source_array.ndim
+            indexer[iaxis] = out_regular
+            write_index = tuple(indexer)
+            if field_names is None:
+                merged = np.add.reduceat(
+                    source_array, reduce_indices, axis=iaxis
+                )
+                target[write_index] = np.take(
+                    merged, range(len(group_starts)), axis=iaxis
+                )
+            else:
+                for field in field_names:
+                    merged = np.add.reduceat(
+                        source_array[field], reduce_indices, axis=iaxis
+                    )
+                    target[field][write_index] = np.take(
+                        merged, range(len(group_starts)), axis=iaxis
+                    )
+            self._copy_flow_bins(
+                source_array,
+                target,
+                iaxis,
+                n_bins,
+                offset,
+                len(group_starts),
+                has_underflow,
+                has_overflow,
+                field_names=field_names,
+            )
+
+        return result
+
+    @staticmethod
+    def _copy_flow_bins(
+        source: np.typing.NDArray[Any],
+        target: Any,
+        iaxis: int,
+        n_bins: int,
+        offset: int,
+        n_groups: int,
+        has_underflow: bool,
+        has_overflow: bool,
+        field_names: tuple[str, ...] | None = None,
+    ) -> None:
+        # Flow bins are copied verbatim; they must never enter regular bins.
+        def flow_index(position: int) -> tuple[Any, ...]:
+            indexer: list[Any] = [slice(None)] * source.ndim
+            indexer[iaxis] = position
+            return tuple(indexer)
+
+        if has_underflow:
+            under = flow_index(0)
+            if field_names is None:
+                target[under] = source[under]
+            else:
+                for field in field_names:
+                    target[field][under] = source[field][under]
+        if has_overflow:
+            src_over = flow_index(n_bins + offset)
+            dst_over = flow_index(n_groups + offset)
+            if field_names is None:
+                target[dst_over] = source[src_over]
+            else:
+                for field in field_names:
+                    target[field][dst_over] = source[field][src_over]
+
+    @staticmethod
+    def _merge_mean_axis(
+        source: Any,
+        target: Any,
+        iaxis: int,
+        group_starts: list[int],
+        group_stops: list[int],
+        offset: int,
+        has_underflow: bool,
+        has_overflow: bool,
+    ) -> None:
+        # Iterate over every line parallel to the rebinned axis and add the
+        # accumulators of the original bins in each group.
+        src_axis_size = source.shape[iaxis]
+        dst_axis_size = target.shape[iaxis]
+        line_shape = list(source.shape)
+        del line_shape[iaxis]
+        for line_index in np.ndindex(tuple(line_shape)):
+            src_line_index: list[Any] = list(line_index)
+            dst_line_index: list[Any] = list(line_index)
+            src_line_index.insert(iaxis, slice(None))
+            dst_line_index.insert(iaxis, slice(None))
+            src_line = source[tuple(src_line_index)]
+            dst_line = target[tuple(dst_line_index)]
+            for out_pos, (start, stop) in enumerate(
+                zip(group_starts, group_stops, strict=True)
+            ):
+                accumulator = src_line[start]
+                for bin_index in range(start + 1, stop):
+                    accumulator = accumulator + src_line[bin_index]
+                dst_line[offset + out_pos] = accumulator
+            if has_underflow:
+                dst_line[0] = src_line[0]
+            if has_overflow:
+                dst_line[dst_axis_size - 1] = src_line[src_axis_size - 1]
